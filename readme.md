@@ -20,7 +20,7 @@ Please read the comments in the config.ini.
 
 ## To compile with pyinstaller by yourself:
 
-For who are interested in compiling an executable file. Please try to follow the items below to compile. The compiled file should be around 101 MB on windows. This version already tries to reduce the size by avoiding unnecessary libraries in both coding and packages.\
+For who are interested in compiling an executable file. Please try to follow the items below to compile. The compiled file should be around 101 MB on windows. This version already tries to reduce the size by avoiding unnecessary libraries in both coding and packages.
 
 0. (Optional) To have a smaller file, it is recommended to use the provided env_anaconda.yaml file to create an environment in Anaconda.
 1. Locate the folder of the meegkit package to open testing.py and denoise.py (under utils).
