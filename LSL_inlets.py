@@ -46,22 +46,21 @@ class DataInlet(Inlet):
     should be plotted as multiple lines."""
     dtypes = [[], np.float32, np.float64, None, np.int32, np.int16, np.int8, np.int64]
 
-    def __init__(self, info: pylsl.StreamInfo, plt: pg.PlotItem, plot_duration, global_clock_ref, curve_names, ch_colors):
-        super().__init__(info, plot_duration, global_clock_ref)
+    def __init__(self, info: pylsl.StreamInfo, plt: pg.PlotItem, plot_duration, buffer_ratio, global_clock_ref, curve_names, ch_colors):
+        super().__init__(info, int(plot_duration*buffer_ratio), global_clock_ref)
         # calculate the size for our buffer, i.e. two times the displayed data
         self.plot_samples = math.ceil(info.nominal_srate() * plot_duration)
         self.plot_duration = plot_duration
         self.srate = info.nominal_srate()
-        bufsize = (4 * self.plot_samples, info.channel_count())
+        bufsize = (int(buffer_ratio * self.plot_samples), info.channel_count())
         self.buffer = np.empty(bufsize, dtype=self.dtypes[info.channel_format()])
         self.timestamps = None
-        empty = np.array([])
         # create one curve object for each channel/line that will handle displaying the data
         self.curves = [pg.PlotCurveItem(x=np.array([x for x in range(self.plot_samples)]), y=np.full(self.plot_samples, fill_value=np.nan),
                             name=curve_names[i], autoDownsample=True, pen=pg.mkPen(pg.mkColor(ch_colors[i%len(ch_colors)]))) for i in range(self.channel_count)]
         for curve in self.curves:
             plt.addItem(curve)
-        self.prev_x = 0 # for the x position of plotting
+        self.start_x = 0 # for the x position of plotting
         self.ref_time_at_left = pylsl.local_clock()
 
     def pull_and_plot(self, plot_time, yshift, proc_func=None, plot_mode='Scroll'):
@@ -86,32 +85,43 @@ class DataInlet(Inlet):
             return y # return processed y
 
     def refresh_data(self, y, ts, yshift, plot_time):
-        n_start_over = self.prev_x + ts.size - self.plot_samples # > 0 = need to go back
+        n_start_over = self.start_x + ts.size - self.plot_samples # > 0 = need to go back
+        if n_start_over > 0:
+            n_start_over = n_start_over % self.plot_samples # in case a super long pause
         this_x, _ = self.curves[0].getData()
         if len(this_x) < self.plot_samples:
-            this_x = np.arange(min(self.prev_x + ts.size, self.plot_samples))
+            print('This case, len(this_x) < self.plot_samples, should never happen. Please notify developer if you read this...')
+            this_x = np.arange(min(self.start_x + ts.size, self.plot_samples))
         for ch_ix in range(self.channel_count):
             y[:, ch_ix] = y[:, ch_ix] + yshift[ch_ix]
             _, this_y = self.curves[ch_ix].getData()
-            if n_start_over <= 0:
-                if len(this_y) == self.plot_samples:
-                    this_y[self.prev_x:self.prev_x+ts.size] = y[:, ch_ix]
+            if n_start_over == 0:
+                if ts.size >= self.plot_samples:
+                    this_y = y[-self.plot_samples:, ch_ix]
                 else:
+                    this_y[-ts.size:] = y[:, ch_ix]
+            elif n_start_over < 0:
+                if len(this_y) == self.plot_samples:
+                    this_y[self.start_x:self.start_x+ts.size] = y[:, ch_ix]
+                else:
+                    print('This case, len(this_y) != self.plot_samples, should never happen. Please notify developer if you read this...')
                     this_y = np.hstack((this_y, y[:, ch_ix]))
             else:
                 this_y[0:n_start_over] = y[ts.size-n_start_over:, ch_ix]
+                plt_x = max(n_start_over, self.start_x)
+                remain_sample = self.plot_samples - plt_x
+                this_y[plt_x:self.plot_samples] = y[ts.size-remain_sample-n_start_over:ts.size-n_start_over, ch_ix]
                 if len(this_y) != self.plot_samples:
-                    old_y = this_y
+                    print('This case, len(this_y) != self.plot_samples, should never happen. Please notify developer if you read this...')
+                    old_y = this_y.copy()
                     this_y = np.arange(self.plot_samples)
-                    this_y[:self.prev_x] = old_y
-                this_y[self.prev_x:self.plot_samples] = y[0:ts.size-n_start_over, ch_ix]
+                    this_y[:self.start_x] = old_y
             self.curves[ch_ix].setData(x=this_x, y=this_y)
 
-        if n_start_over > 0:
-            self.prev_x = n_start_over
-        else:
-            self.prev_x += ts.size
-        self.ref_time_at_left = ts[-1] - (self.prev_x-1)/self.srate - self.global_clock_ref
+        self.start_x += ts.size
+        self.start_x = self.start_x%self.plot_samples
+        self.ref_time_at_left = ts[-1] - (self.start_x)/self.srate - self.global_clock_ref
+
 
     def scroll_data(self, y, ts, yshift, plot_time):
         this_x = None
@@ -150,7 +160,7 @@ class MarkerInlet(Inlet):
         self.refresh_time = 0
         self.prev_check_time = pylsl.local_clock()
 
-    def pull_and_plot(self, plot_time, time_left_refresh, idx_prev_x_signal, srate=None, plot_mode='Scroll', prev_x=0, sname=None):
+    def pull_and_plot(self, plot_time, time_left_refresh, idx_prev_x_signal, srate=None, plot_mode='Scroll', prev_x=0, sname=None, doPlot=True):
         # note: plot_time is the time at left most part
         # srate is needed for refresh mode
 
@@ -160,11 +170,16 @@ class MarkerInlet(Inlet):
 
         if not timestamps and ((pylsl.local_clock() - self.prev_check_time) > 1):
             self.refresh_time = idx_prev_x_signal
-
         # add new events
         if timestamps:
+            # print(f'event: {pylsl.local_clock() - timestamps[-1]}')
+            to_pop = []
             # update refresh_time because it may happens that event marker has a much higher sampling rate for a very slow signal
-            for string, ts in zip(strings, timestamps):
+            for i, (string, ts) in enumerate(zip(strings, timestamps)):
+                if string == ['']:
+                    print(f"Received an empty string, {string}, as event, this won't be treated")
+                    to_pop.append(i)
+                    continue
                 if isinstance(string[0], str): # this should be sent by LSL from the trigger_manager
                     string = string[0]
                 else:
@@ -173,46 +188,60 @@ class MarkerInlet(Inlet):
                     ts_ = ts
                     ts = ts - self.global_clock_ref
                     if ts >= time_left_refresh:
-                        ts = (ts - time_left_refresh)*srate
+                        ts = ts - time_left_refresh
                         if ts > (self.plot_dur):
-                            ts -= (self.plot_dur)
+                            ts %= (self.plot_dur)
+                        ts*=srate
                     else:
                         ts = (self.plot_dur - (time_left_refresh - ts))*srate
 
-                    infline = pg.InfiniteLine(ts, angle=90, movable=False, label=string)
+                    if doPlot:
+                        infline = pg.InfiniteLine(ts, angle=90, movable=False, label=string)
                     if ts_ == timestamps[-1]:
-                        # print(f'{sname}, refresh: {ts}')
                         self.refresh_time  = ts
                         self.prev_check_time = pylsl.local_clock()
                 else:
-                    infline = pg.InfiniteLine(ts, angle=90, movable=False, label=string)
-
-                infline.label.setHtml(f'<font size="+4">{string}</font>')
-                self.items.append(infline)
-                self.plt.addItem(self.items[-1])
+                    if doPlot:
+                        infline = pg.InfiniteLine(ts, angle=90, movable=False, label=string)
+                if doPlot:
+                    infline.label.setHtml(f'<font size="+4">{string}</font>')
+                    self.items.append(infline)
+                    self.plt.addItem(self.items[-1])
+            if len(to_pop) > 0:
+                to_pop.reverse()
+                for li in to_pop:
+                    self.new_events['time'].pop(li)
+                    self.new_events['event'].pop(li)
         # remove old events
-        nData = self.plt.getAxis('bottom').range[1] - self.plt.getAxis('bottom').range[0]
-        remove_limit = self.refresh_time + self.remove_limit_range
-        # if remove_limit > nData: remove_limit -= nData
-        checked = 0
-        while True:
-            if len(self.items) == 0: break
-            if len(self.items) == checked: break
-            evt_x = self.items[checked].getXPos()
-            if plot_mode == 'Scroll':
-                if evt_x < plot_time:
-                    self.plt.removeItem(self.items[checked])
-                    self.items.pop(checked)
-                else:
-                    checked+=1
-                    break
-            if plot_mode == 'Refresh':
-                if (self.refresh_time < evt_x < remove_limit) or \
-                    ((remove_limit > nData) and evt_x < (remove_limit-nData)):
-                    self.plt.removeItem(self.items[checked])
-                    self.items.pop(checked)
-                else:
-                    checked+=1
+        if doPlot:
+            nData = self.plt.getAxis('bottom').range[1] - self.plt.getAxis('bottom').range[0]
+            remove_limit = self.refresh_time + self.remove_limit_range
+            # if remove_limit > nData: remove_limit -= nData
+            checked = 0
+            while True:
+                if len(self.items) == 0: break
+                if len(self.items) == checked: break
+                evt_x = self.items[checked].getXPos()
+                if plot_mode == 'Scroll':
+                    # print(evt_x, plot_time)
+                    if evt_x < plot_time:
+                        self.plt.removeItem(self.items[checked])
+                        self.items.pop(checked)
+                        # print('removed a marker', len(self.items))
+                    else:
+                        checked+=1
+                        break
+                if plot_mode == 'Refresh':
+                    # print(sname, remove_limit, evt_x, refresh_time)
+                    if (self.refresh_time < evt_x < remove_limit) or \
+                        ((remove_limit > nData) and evt_x < (remove_limit-nData)):
+                        # print(sname, self.refresh_time, evt_x, remove_limit, remove_limit-nData)
+                        self.plt.removeItem(self.items[checked])
+                        self.items.pop(checked)
+                        # print('removed a marker', len(self.items))
+                    else:
+                        checked+=1
+                    # else: break
 
     def clear_all_markers(self):
         for m in reversed(self.items):

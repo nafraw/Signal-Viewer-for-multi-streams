@@ -9,6 +9,7 @@ from pyqtgraph import PlotWidget
 from pyqtgraph.Qt import QtCore, QtGui
 import sys
 from os.path import dirname
+from os import environ
 
 # Note: this file includes several commented lines using pandas. However, use of pandas
 # was discarded because pyinstaller will lead to a large exe file due to used libraries.
@@ -38,11 +39,12 @@ import configparser
 def read_config():
     cfg = configparser.ConfigParser()
     cfg.read('./config.ini')
-    global update_interval, pull_interval, fudge_factor, labelStyles, ch_colors, target_streams, stream_configs, channel_per_column
+    global update_interval, pull_interval, fudge_factor, labelStyles, ch_colors, target_streams, stream_configs, channel_per_column, buffer_ratio
     update_interval = int(cfg.getfloat('Time', 'update_interval'))
     pull_interval = int(cfg.getfloat('Time', 'pull_interval'))
     fudge_factor = cfg.getfloat('Time', 'fudge_factor')
     fudge_factor = fudge_factor * pull_interval
+    buffer_ratio = cfg.getfloat('Time', 'buffer_ratio')
     labelStyles = {'colors': None, 'font-size': None}
     labelStyles['color'] = cfg.get('Figure', 'label_color')
     labelStyles['font-size'] = cfg.get('Figure', 'fontsize')
@@ -90,8 +92,8 @@ def read_asr_config():
 
 def read_ui_config():
     cfg = configparser.ConfigParser()
-    cfg.read('./config.ini')
-    return cfg.get('UI', 'fontsize')
+    cfg.read('./config.ini')    
+    return cfg.get('UI', 'fontsize'), cfg.getboolean('UI', 'enable_highdpi_scaling')
 
 class SpectrogramWidget(PlotWidget):
     def __init__(self, ch_idx, win_size, step_size, srate, plot_duration, plot_mode, streamname, stream_config, windowflag=None):
@@ -375,7 +377,7 @@ class SignalPlotWidget(PlotWidget):
                     continue
                 else: # signals
                     procssed_data = inlet.pull_and_plot(mintime, self.yshift, self.proc_fun, self.plot_mode)
-                    prev_x = inlet.prev_x
+                    prev_x = inlet.start_x
                     x_left_refresh = inlet.ref_time_at_left
                     if inlet.chunk_size > 0:
                         y = inlet.buffer[0:inlet.chunk_size, :]
@@ -504,6 +506,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def connect_to_LSL(self):
         read_config()
+        self.buffer_ratio = buffer_ratio
         self.global_clock_ref = pylsl.local_clock()
         self.comboBox_streamName.clear()
         for w in self.widget_signal.values():
@@ -558,17 +561,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.streamname_with_event.append(w.streamname)
                 for s in self.inlets:
                     remove_limit_range = w.inlets[0].srate*1
-                    print(remove_limit_range)
+                    print(f"remove_limit_range for MarkerInlet set as {remove_limit_range}")
                     w.inlets.append(MarkerInlet(s, w.plt, self.plot_duration, self.global_clock_ref, remove_limit_range=remove_limit_range))
             self.widget_signal[self.streamname_with_event[0]].saveEvent = True
 
         for w in self.widget_signal.values():
             low_cut, high_cut = stream_configs[w.streamname]['init_bandpass']
+            self.lineEdit_bandpass_low.setText(str(low_cut))
+            self.lineEdit_bandpass_high.setText(str(high_cut))
             if low_cut != high_cut:
                 w.init_bandpass_filter(low_cut, high_cut, name=w.streamname, verbose=False)
             low_cut, high_cut = stream_configs[w.streamname]['init_bandstop']
+            self.lineEdit_bandstop_low.setText(str(low_cut))
+            self.lineEdit_bandstop_high.setText(str(high_cut))
             if low_cut != high_cut:
-                w.init_bandstop_filter(low_cut, high_cut, name=w.streamname, verbose=False)            
+                w.init_bandstop_filter(low_cut, high_cut, name=w.streamname, verbose=False)
+            self.comboBox_streamName.setCurrentText(w.streamname)
         self.organizeSignalWidget()
 
     def getfile(self):
@@ -638,15 +646,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.comboBox_spectrogram.clear()
             self.comboBox_spectrogram.addItems(stream_configs[name]['channel_names'] + ['All'])
             self.comboBox_spectrogram.setCurrentIndex(stream_configs[name]['channel_count'])
+            self.lineEdit_bandpass_low.setText(str(stream_configs[self.streamname]['init_bandpass'][0]))
+            self.lineEdit_bandpass_high.setText(str(stream_configs[self.streamname]['init_bandpass'][1]))
+            self.lineEdit_bandstop_low.setText(str(stream_configs[self.streamname]['init_bandstop'][0]))
+            self.lineEdit_bandstop_high.setText(str(stream_configs[self.streamname]['init_bandstop'][1]))
+            self.lineEdit_spacing.setText(str(self.widget_signal[name].spacing))
+            self.lineEdit_duration.setText(str(self.widget_signal[name].plot_duration))
 
     def bandPass(self, verbose=True):
         low = float(self.lineEdit_bandpass_low.text())
         high = float(self.lineEdit_bandpass_high.text())
+        stream_configs[self.streamname]['init_bandpass'] = [low, high]
         self.widget_signal[self.streamname].init_bandpass_filter(low, high, name=self.streamname, verbose=verbose)
 
     def bandStop(self, verbose=True):
         low = float(self.lineEdit_bandstop_low.text())
         high = float(self.lineEdit_bandstop_high.text())
+        stream_configs[self.streamname]['init_bandstop'] = [low, high]
         status = self.widget_signal[self.streamname].init_bandstop_filter(low, high, name=self.streamname, verbose=verbose)
         if status:
             self.label_status.setText(f"bandstop is ON")
@@ -661,7 +677,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.label_status.setText(f"ASR is OFF")
 
     def organizeSignalWidget(self):
-        self.wid = QtGui.QWidget(self) # ref: https://stackoverflow.com/questions/37304684/qwidgetsetlayout-attempting-to-set-qlayout-on-mainwindow-which-already
+        # ref: https://stackoverflow.com/questions/37304684/qwidgetsetlayout-attempting-to-set-qlayout-on-mainwindow-which-already
+        try:
+            self.wid = QtGui.QWidget(self)  # Qt4
+        except:
+            self.wid = QtWidgets.QWidget(self) # Qt5
         self.setCentralWidget(self.wid)
         ## handle SignalWidget layout
         vLayout = [QVBoxLayout()]
@@ -735,7 +755,7 @@ class MainWindow(QtWidgets.QMainWindow):
             name_channel = stream_configs[name]['channel_names']
         else:
             name_channel = [f'Ch{i}' for i in range(stream.channel_count())]
-        self.widget_signal[name].inlets = [DataInlet(stream, self.widget_signal[name].plt, self.plot_duration, self.global_clock_ref, name_channel, ch_colors)]
+        self.widget_signal[name].inlets = [DataInlet(stream, self.widget_signal[name].plt, self.plot_duration, self.buffer_ratio, self.global_clock_ref, name_channel, ch_colors)]
         self.widget_signal[name].srate = self.widget_signal[name].inlets[0].srate
         self.widget_signal[name].total_ch = self.widget_signal[name].inlets[0].channel_count
         self.n_inlet += 1
@@ -790,17 +810,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lineEdit_spacing.editingFinished.connect(self.changeSpacing)
 
 def main():
+    fontsize, enable_highDPI = read_ui_config()
+    if enable_highDPI:
+        # source: https://stackoverflow.com/questions/41331201/pyqt-5-and-4k-screen
+        environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
     app = QtWidgets.QApplication(sys.argv)
-    # app.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
-    fontsize = read_ui_config()
+    if enable_highDPI:
+        app.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
+    
     app.setStyleSheet("QLabel{font-size:" + fontsize + ";}")
-    app.setStyleSheet("QPushButton{font-size:" + fontsize + ";}")
-    # app.setStyleSheet("QLabel{font-size: 6.5pt;}")
-    # app.setStyleSheet("QPushButton{font-size: 6.5pt;}")
+    app.setStyleSheet("QPushButton{font-size:" + fontsize + ";}")    
 
     screen = app.primaryScreen()
     main = MainWindow(screen)
-    # main.showMaximized()
     main.showNormal()
     main.move(0, 0)
     
